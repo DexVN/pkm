@@ -1,87 +1,32 @@
 #!/usr/bin/env bash
 
-set -e
-
-# Thay USERNAME/pkm bằng tên GitHub repo của bạn
-REPO_URL="https://github.com/USERNAME/pkm.git"
-INSTALL_DIR="$HOME/.pkm"
-
-echo "🚀 Đang tiến hành cài đặt PKM (Personal Package Manager)..."
-
-# 1. Clone repository về ~/.pkm
-if [ -d "$INSTALL_DIR" ]; then
-    echo "🔄 Đã tìm thấy ~/.pkm, đang cập nhật..."
-    git -C "$INSTALL_DIR" pull --quiet
-else
-    echo "📥 Đang tải PKM từ GitHub..."
-    git clone --quiet "$REPO_URL" "$INSTALL_DIR"
-fi
-
-# 2. Tạo các thư mục làm việc cần thiết
-mkdir -p "$INSTALL_DIR/packages"
-mkdir -p "$INSTALL_DIR/bin"
-
-# 3. Cấp quyền thi hành
-chmod +x "$INSTALL_DIR/bin/pkm"
-
-# 4. Tự động thêm PATH vào Shell Config (.zshrc hoặc .bashrc)
-SHELL_CONFIG=""
-if [ -n "$ZSH_VERSION" ] || [ -f "$HOME/.zshrc" ]; then
-    SHELL_CONFIG="$HOME/.zshrc"
-elif [ -f "$HOME/.bashrc" ]; then
-    SHELL_CONFIG="$HOME/.bashrc"
-fi
-
-PATH_CMD='export PATH="$HOME/.pkm/bin:$PATH"'
-
-if [ -n "$SHELL_CONFIG" ]; then
-    if ! grep -q '\.pkm/bin' "$SHELL_CONFIG"; then
-        echo "" >> "$SHELL_CONFIG"
-        echo "# PKM Package Manager" >> "$SHELL_CONFIG"
-        echo "$PATH_CMD" >> "$SHELL_CONFIG"
-        echo "✅ Đã thêm $HOME/.pkm/bin vào $SHELL_CONFIG"
-    fi
-fi
-
-echo ""
-echo "🎉 Cài đặt hoàn tất!"
-echo "👉 Hãy chạy lệnh sau để áp dụng ngay:"
-echo "   source $SHELL_CONFIG"
-echo ""
-echo "💡 Thử nghiệm với lệnh: pkm install fnm"
-
 PKM_DIR="$HOME/.pkm"
 RECIPES_DIR="$PKM_DIR/recipes"
 PACKAGES_DIR="$PKM_DIR/packages"
 BIN_DIR="$PKM_DIR/bin"
 
-# 1. Hàm cài đặt theo tên công cụ truyền vào
+# 1. Cài đặt công cụ
 install_package() {
     PKG_NAME=$1
 
-    # Kiểm tra người dùng có nhập tên công cụ không
     if [ -z "$PKG_NAME" ]; then
-        echo "❌ Lỗi: Bạn chưa nhập tên công cụ! Cú pháp: pkm install <tên_công_cụ>"
+        echo "❌ Lỗi: Cú pháp: pkm install <tên_công_cụ>"
         exit 1
     fi
 
-    # Đường dẫn tới file recipe
     RECIPE="$RECIPES_DIR/$PKG_NAME.sh"
 
-    # Kiểm tra xem có recipe tương ứng trong thư mục recipes/ không
     if [ ! -f "$RECIPE" ]; then
         echo "❌ Lỗi: Không tìm thấy công thức cài đặt cho '$PKG_NAME'"
-        echo "💡 Gợi ý: Kiểm tra file recipes/$PKG_NAME.sh đã tồn tại chưa."
         exit 1
     fi
 
-    # Đọc các biến khai báo trong file recipe
     source "$RECIPE"
 
     INSTALL_DIR="$PACKAGES_DIR/$NAME/$VERSION"
     TEMP_FILE="/tmp/${NAME}_download"
 
-    echo "📦 Đang tải $NAME (Phiên bản $VERSION)..."
+    echo "📦 Đang tải $NAME ($VERSION)..."
     mkdir -p "$INSTALL_DIR"
     curl -L -o "$TEMP_FILE" "$URL"
 
@@ -91,25 +36,53 @@ install_package() {
     elif [ "$TYPE" == "tar.gz" ]; then
         tar -xzf "$TEMP_FILE" -C "$INSTALL_DIR"
     elif [ "$TYPE" == "binary" ]; then
-        # Nếu là file chạy trực tiếp, chuyển thẳng vào thư mục cài đặt
         mv "$TEMP_FILE" "$INSTALL_DIR/$BINARY_NAME"
     fi
 
-    # Xóa file tạm nếu chưa xóa
     rm -f "$TEMP_FILE"
 
-    echo "🔗 Đang tạo liên kết thực thi (Symlink)..."
+    echo "🔗 Đang tạo Symlink..."
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
     ln -sf "$INSTALL_DIR/$BINARY_NAME" "$BIN_DIR/$BINARY_NAME"
 
-    echo "✅ Cài đặt thành công $NAME! Bạn có thể dùng lệnh '$BINARY_NAME' ngay bây giờ."
+    echo "✅ Cài đặt thành công $NAME ($VERSION)!"
 }
 
-# 2. Hàm gỡ bỏ công cụ
+# 2. Chuyển đổi phiên bản (Switch Version)
+switch_version() {
+    PKG_NAME=$1
+    TARGET_VER=$2
+
+    if [ -z "$PKG_NAME" ] || [ -z "$TARGET_VER" ]; then
+        echo "❌ Lỗi: Cú pháp: pkm switch <tên_công_cụ> <phiên_bản>"
+        echo "💡 Ví dụ: pkm switch node 18.20.0"
+        exit 1
+    fi
+
+    # Tìm file recipe để lấy BINARY_NAME chính xác
+    RECIPE="$RECIPES_DIR/$PKG_NAME.sh"
+    if [ -f "$RECIPE" ]; then
+        source "$RECIPE"
+    else
+        BINARY_NAME="$PKG_NAME"
+    fi
+
+    TARGET_BIN="$PACKAGES_DIR/$PKG_NAME/$TARGET_VER/$BINARY_NAME"
+
+    if [ -f "$TARGET_BIN" ]; then
+        ln -sf "$TARGET_BIN" "$BIN_DIR/$BINARY_NAME"
+        echo "🔄 Đã chuyển $PKG_NAME sang sử dụng phiên bản $TARGET_VER!"
+    else
+        echo "❌ Lỗi: Phiên bản $TARGET_VER của $PKG_NAME chưa được cài đặt tại $PACKAGES_DIR/$PKG_NAME/"
+        echo "💡 Gợi ý: Kiểm tra danh sách phiên bản đã tải bằng: ls $PACKAGES_DIR/$PKG_NAME"
+    fi
+}
+
+# 3. Gỡ bỏ công cụ
 remove_package() {
     PKG_NAME=$1
     if [ -z "$PKG_NAME" ]; then
-        echo "❌ Lỗi: Cú pháp gỡ bỏ: pkm remove <tên_công_cụ>"
+        echo "❌ Lỗi: Cú pháp: pkm remove <tên_công_cụ>"
         exit 1
     fi
 
@@ -125,27 +98,46 @@ remove_package() {
     fi
 }
 
-# 3. Liệt kê các công cụ đã cài
+# 4. Liệt kê các công cụ đã cài
 list_packages() {
     echo "📋 Các công cụ đã cài đặt qua PKM:"
-    ls -1 "$PACKAGES_DIR" 2>/dev/null || echo "(Chưa cài công cụ nào)"
+    if [ -d "$PACKAGES_DIR" ] && [ "$(ls -A "$PACKAGES_DIR")" ]; then
+        for pkg in "$PACKAGES_DIR"/*; do
+            if [ -d "$pkg" ]; then
+                pkg_name=$(basename "$pkg")
+                versions=$(ls -1 "$pkg" | tr '\n' ' ')
+                echo "  • $pkg_name (Phiên bản khả dụng: $versions)"
+            fi
+        done
+    else
+        echo "  (Chưa cài công cụ nào)"
+    fi
 }
 
-# Điều hướng tham số
+# 5. Cập nhật recipe từ Git Remote
+update_pkm() {
+    echo "🔄 Đang cập nhật recipes từ GitHub..."
+    if [ -d "$PKM_DIR/.git" ]; then
+        git -C "$PKM_DIR" pull --quiet
+        echo "✅ Cập nhật hoàn tất!"
+    else
+        echo "❌ $PKM_DIR không phải là một Git repository!"
+    fi
+}
+
+# Điều hướng lệnh
 case "$1" in
-    install)
-        install_package "$2"
-        ;;
-    remove)
-        remove_package "$2"
-        ;;
-    list)
-        list_packages
-        ;;
+    install)  install_package "$2" ;;
+    switch)   switch_version "$2" "$3" ;;
+    remove)   remove_package "$2" ;;
+    list)     list_packages ;;
+    update)   update_pkm ;;
     *)
-        echo "Cú pháp sử dụng:"
-        echo "  pkm install <tên_công_cụ>  - Cài đặt công cụ"
-        echo "  pkm remove <tên_công_cụ>   - Gỡ bỏ công cụ"
-        echo "  pkm list                  - Xem danh sách đã cài"
+        echo "Cú pháp sử dụng PKM:"
+        echo "  pkm install <tên_gói>        - Cài đặt gói"
+        echo "  pkm switch <tên_gói> <ver>   - Nhanh chóng đổi phiên bản"
+        echo "  pkm remove <tên_gói>         - Gỡ bỏ gói"
+        echo "  pkm list                    - Xem danh sách và các phiên bản đã cài"
+        echo "  pkm update                  - Cập nhật recipes từ GitHub"
         ;;
 esac
