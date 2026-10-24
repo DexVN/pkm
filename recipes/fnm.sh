@@ -1,0 +1,5 @@
+NAME="fnm"
+VERSION="1.38.1"
+URL="https://github.com/Schniz/fnm/releases/download/v1.38.1/fnm-macos.zip"
+BINARY_NAME="fnm"
+TYPE="zip"
