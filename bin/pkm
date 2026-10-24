@@ -33,7 +33,7 @@ install_package() {
     echo "📂 Extracting files..."
     if [ "$TYPE" == "zip" ]; then
         unzip -o -q "$TEMP_FILE" -d "$INSTALL_DIR"
-    elif [ "$TYPE" == "tar.gz" ]; then
+    elif [ "$TYPE" == "tar.gz" ] || [ "$TYPE" == "tgz" ]; then
         tar -xzf "$TEMP_FILE" -C "$INSTALL_DIR"
     elif [ "$TYPE" == "binary" ]; then
         mv "$TEMP_FILE" "$INSTALL_DIR/$BINARY_NAME"
@@ -41,9 +41,17 @@ install_package() {
 
     rm -f "$TEMP_FILE"
 
+    TARGET_BIN=$(find "$INSTALL_DIR" -type f -name "$BINARY_NAME" | head -n 1)
+
+    if [ -z "$TARGET_BIN" ]; then
+        echo "❌ Error: Binary '$BINARY_NAME' not found in extracted files."
+        exit 1
+    fi
+
     echo "🔗 Creating symlink..."
-    chmod +x "$INSTALL_DIR/$BINARY_NAME"
-    ln -sf "$INSTALL_DIR/$BINARY_NAME" "$BIN_DIR/$BINARY_NAME"
+    chmod +x "$TARGET_BIN"
+    mkdir -p "$BIN_DIR"
+    ln -sf "$TARGET_BIN" "$BIN_DIR/$BINARY_NAME"
 
     echo "✅ Successfully installed $NAME ($VERSION)!"
 }
