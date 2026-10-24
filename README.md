@@ -19,9 +19,8 @@
 Mở Terminal và chạy câu lệnh sau để cài đặt PKM tự động:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USERNAME/pkm/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DexVN/pkm/main/install.sh | bash
 ```
-> *(Lưu ý: Thay `USERNAME` bằng tên tài khoản GitHub của bạn)*
 
 Sau khi cài đặt hoàn tất, hãy khởi chạy lại Terminal hoặc nạp lại cấu hình:
 ```bash
