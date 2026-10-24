@@ -2,29 +2,29 @@
 
 set -e
 
-# Thay USERNAME/pkm bằng tên GitHub repo của bạn
+# Replace with your GitHub repository URL
 REPO_URL="https://github.com/DexVN/pkm.git"
 INSTALL_DIR="$HOME/.pkm"
 
-echo "🚀 Đang tiến hành cài đặt PKM (Personal Package Manager)..."
+echo "🚀 Installing PKM (Personal Package Manager)..."
 
-# 1. Clone repository về ~/.pkm
+# 1. Clone repository to ~/.pkm
 if [ -d "$INSTALL_DIR" ]; then
-    echo "🔄 Đã tìm thấy ~/.pkm, đang cập nhật..."
+    echo "🔄 Existing installation found at ~/.pkm, updating..."
     git -C "$INSTALL_DIR" pull --quiet
 else
-    echo "📥 Đang tải PKM từ GitHub..."
+    echo "📥 Downloading PKM from GitHub..."
     git clone --quiet "$REPO_URL" "$INSTALL_DIR"
 fi
 
-# 2. Tạo các thư mục làm việc cần thiết
+# 2. Create required directories
 mkdir -p "$INSTALL_DIR/packages"
 mkdir -p "$INSTALL_DIR/bin"
 
-# 3. Cấp quyền thi hành
+# 3. Grant execute permissions
 chmod +x "$INSTALL_DIR/bin/pkm"
 
-# 4. Tự động thêm PATH vào Shell Config (.zshrc hoặc .bashrc)
+# 4. Automatically add PATH to Shell Config (.zshrc or .bashrc)
 SHELL_CONFIG=""
 if [ -n "$ZSH_VERSION" ] || [ -f "$HOME/.zshrc" ]; then
     SHELL_CONFIG="$HOME/.zshrc"
@@ -39,13 +39,13 @@ if [ -n "$SHELL_CONFIG" ]; then
         echo "" >> "$SHELL_CONFIG"
         echo "# PKM Package Manager" >> "$SHELL_CONFIG"
         echo "$PATH_CMD" >> "$SHELL_CONFIG"
-        echo "✅ Đã thêm $HOME/.pkm/bin vào $SHELL_CONFIG"
+        echo "✅ Added $HOME/.pkm/bin to $SHELL_CONFIG"
     fi
 fi
 
 echo ""
-echo "🎉 Cài đặt hoàn tất!"
-echo "👉 Hãy chạy lệnh sau để áp dụng ngay:"
-echo "   source $SHELL_CONFIG"
+echo "🎉 Installation complete!"
+echo "👉 Run the following command to apply changes:"
+echo "    source $SHELL_CONFIG"
 echo ""
-echo "💡 Thử nghiệm với lệnh: pkm install fnm"
+echo "💡 Try running: pkm install fnm"
