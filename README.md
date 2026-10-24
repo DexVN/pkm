@@ -79,7 +79,7 @@ PKM quản lý tất cả các công cụ bên trong thư mục ẩn `~/.pkm`:
 
 ---
 
-## 📝 Cách thêm công cụ mới (Recipe)
+✅ ### 🛠️ Dành cho nhà phát triển: Cấu trúc một Recipe mới
 
 Để thêm một công cụ mới vào danh mục hỗ trợ, bạn chỉ cần tạo một file kịch bản tên `<tên_gói>.sh` nằm trong thư mục `recipes/` với nội dung mẫu:
 
