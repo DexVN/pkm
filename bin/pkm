@@ -1,51 +1,460 @@
 #!/usr/bin/env bash
+#
+# PKM (Personal Package Manager) v3.0
+#
+# Recipes are plain data files (KEY=value) and are NEVER executed.
+# Run `pkm help` for usage and the recipe format.
 
-# Bash Strict Mode for better error handling
-set -eo pipefail
+set -euo pipefail
+umask 022
+export LC_ALL=C
 
-# ==========================================
-# DIRECTORY CONFIGURATION
-# ==========================================
-PKM_DIR="$HOME/.pkm"
-RECIPES_DIR="$PKM_DIR/recipes"
-PACKAGES_DIR="$PKM_DIR/packages"
-BIN_DIR="$PKM_DIR/bin"
-
-# Create directories if they do not exist
-mkdir -p "$RECIPES_DIR" "$PACKAGES_DIR" "$BIN_DIR"
+PKM_VERSION="3.0"
+SELF="$0"
 
 # ==========================================
 # COLORS & UI
 # ==========================================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No color
+if [ -t 1 ] && [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'
+    CYAN=$'\033[0;36m'
+    NC=$'\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' NC=''
+fi
 
-log_info() { echo -e "${BLUE}ℹ️ $1${NC}"; }
-log_success() { echo -e "${GREEN}✅ $1${NC}"; }
-log_warn() { echo -e "${YELLOW}⚠️ $1${NC}"; }
-log_error() { echo -e "${RED}❌ $1${NC}"; }
+log_info()    { printf '%s\n' "${BLUE}ℹ️  $*${NC}"; }
+log_success() { printf '%s\n' "${GREEN}✅ $*${NC}"; }
+log_warn()    { printf '%s\n' "${YELLOW}⚠️  $*${NC}" >&2; }
+log_error()   { printf '%s\n' "${RED}❌ $*${NC}" >&2; }
+die()         { log_error "$*"; exit 1; }
 
 # ==========================================
-# CLEANUP & SYSTEM CHECKS
+# DIRECTORY CONFIGURATION
 # ==========================================
+PKM_DIR="${PKM_DIR:-${HOME:?HOME is not set}/.pkm}"
+case "$PKM_DIR" in
+    /*) ;;
+    *) die "PKM_DIR must be an absolute path (got: $PKM_DIR)" ;;
+esac
+
+RECIPES_DIR="$PKM_DIR/recipes"
+PACKAGES_DIR="$PKM_DIR/packages"
+BIN_DIR="$PKM_DIR/bin"
+LOCK_DIR="$PKM_DIR/.lock"
+
+# ==========================================
+# GLOBAL STATE
+# ==========================================
+ASSUME_YES=0
+DRY_RUN=0
+FORCE=0
+
 TEMP_FILE=""
+STAGE=""
+LOCK_HELD=0
 
-cleanup() {
+OS=""
+ARCH=""
+
+# Recipe fields (filled by parse_recipe)
+R_NAME="" R_VERSION="" R_DESC="" R_BINS="" R_PLATFORMS=""
+R_GURL="" R_GSUM="" R_GTYPE="" R_PURL="" R_PSUM="" R_PTYPE=""
+# Resolved download (filled by resolve_download)
+DL_URL="" DL_SUM="" DL_TYPE="" R_ERR=""
+PV=""
+
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$'
+SHA_RE='^[0-9a-f]{64}$'
+
+# ==========================================
+# CLEANUP, LOCKING, GENERIC HELPERS
+# ==========================================
+cleanup_temp() {
     if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
-        rm -f "$TEMP_FILE"
+        rm -f -- "$TEMP_FILE"
+    fi
+    if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
+        case "$STAGE" in
+            "$PACKAGES_DIR"/*/.stage.*)
+                rm -rf -- "$STAGE"
+                # Drop the package directory too if this failed install left it empty.
+                rmdir -- "${STAGE%/*}" 2>/dev/null || true
+                ;;
+        esac
+    fi
+    return 0
+}
+
+release_lock() {
+    if [ "$LOCK_HELD" = 1 ]; then
+        rm -rf -- "$LOCK_DIR"
+        LOCK_HELD=0
+    fi
+    return 0
+}
+
+on_exit() {
+    cleanup_temp
+    release_lock
+}
+
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+acquire_lock() {
+    local tries=0 pid=""
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            log_warn "Removing stale lock left by dead process $pid."
+            rm -rf -- "$LOCK_DIR"
+            continue
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 30 ]; then
+            die "Another pkm process is running (pid ${pid:-unknown}). If this is wrong, remove $LOCK_DIR"
+        fi
+        sleep 1
+    done
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    LOCK_HELD=1
+}
+
+lock_if_needed() {
+    if [ "$DRY_RUN" != 1 ]; then
+        acquire_lock
+    fi
+    return 0
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+have_sha256_tool() {
+    command -v sha256sum >/dev/null 2>&1 \
+        || command -v shasum >/dev/null 2>&1 \
+        || command -v openssl >/dev/null 2>&1
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    else
+        return 1
     fi
 }
-trap cleanup EXIT
+
+confirm() {
+    local ans
+    if [ "$ASSUME_YES" = 1 ]; then
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        die "Confirmation required but stdin is not a terminal. Re-run with --yes."
+    fi
+    read -r -p "$1 [y/N] " ans
+    case "$ans" in
+        y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+path_has_bin_dir() {
+    [[ ":$PATH:" == *":$BIN_DIR:"* ]]
+}
 
 check_path() {
-    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    if ! path_has_bin_dir; then
         log_warn "Directory $BIN_DIR is not in your \$PATH."
-        log_warn "Please add the following line to your ~/.bashrc or ~/.zshrc:"
-        echo "export PATH=\"$BIN_DIR:\$PATH\""
+        log_warn "Add the following line to your ~/.bashrc or ~/.zshrc:"
+        printf 'export PATH="%s:$PATH"\n' "$BIN_DIR"
     fi
+    return 0
+}
+
+detect_platform() {
+    local os arch
+    os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    arch=$(uname -m | tr '[:upper:]' '[:lower:]')
+    case "$arch" in
+        x86_64|amd64)  arch="x86_64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7*|armv6*) arch="armv7" ;;
+        i386|i686)     arch="x86" ;;
+    esac
+    [[ "$os" =~ ^[a-z0-9_]+$ && "$arch" =~ ^[a-z0-9_]+$ ]] \
+        || die "Unsupported platform: $os/$arch"
+    OS=$os
+    ARCH=$arch
+}
+
+# ==========================================
+# VALIDATION & SAFE FILESYSTEM HELPERS
+# ==========================================
+is_valid_name() {
+    [[ "${1:-}" =~ $NAME_RE ]]
+}
+
+validate_name() {
+    is_valid_name "${1:-}" \
+        || die "Invalid ${2:-name}: '${1:-}' (allowed: letters, digits, '.', '_', '+', '-'; must start with a letter or digit; max 64 chars)"
+}
+
+# True if <symlink> exists and its target lies inside <dir>.
+points_into() {
+    local target
+    [ -L "$1" ] || return 1
+    target=$(readlink "$1") || return 1
+    [[ "$target" == "$2"/* ]]
+}
+
+# Only ever delete things that live inside $PACKAGES_DIR.
+safe_rm_rf() {
+    local p=$1
+    case "$p" in
+        "$PACKAGES_DIR"/?*) ;;
+        *) die "Refusing to delete a path outside $PACKAGES_DIR: $p" ;;
+    esac
+    case "/$p/" in
+        */../*|*/./*) die "Refusing to delete a suspicious path: $p" ;;
+    esac
+    rm -rf -- "$p"
+}
+
+installed_versions() {  # <pkg> -> one version per line
+    local d
+    for d in "$PACKAGES_DIR/$1"/*/; do
+        [ -d "$d" ] || continue
+        d=${d%/}
+        printf '%s\n' "${d##*/}"
+    done
+    return 0
+}
+
+version_bins() {  # <version_dir> -> binary names, one per line
+    local rel
+    [ -f "$1/.pkm-bins" ] || return 0
+    while IFS= read -r rel || [ -n "$rel" ]; do
+        if [ -n "$rel" ]; then
+            printf '%s\n' "${rel##*/}"
+        fi
+    done < "$1/.pkm-bins"
+    return 0
+}
+
+meta_get() {  # <version_dir> <KEY>
+    [ -f "$1/.pkm-meta" ] || return 0
+    sed -n "s/^$2=//p" "$1/.pkm-meta" | sed -n '1p'
+}
+
+# A version is "active" when one of its binaries is linked from $BIN_DIR.
+is_active() {  # <pkg> <ver>
+    local dir="$PACKAGES_DIR/$1/$2" rel
+    [ -f "$dir/.pkm-bins" ] || return 1
+    while IFS= read -r rel || [ -n "$rel" ]; do
+        [ -n "$rel" ] || continue
+        if points_into "$BIN_DIR/${rel##*/}" "$dir"; then
+            return 0
+        fi
+    done < "$dir/.pkm-bins"
+    return 1
+}
+
+active_version() {  # <pkg> -> prints active version (or nothing)
+    local ver
+    while IFS= read -r ver; do
+        [ -n "$ver" ] || continue
+        if is_active "$1" "$ver"; then
+            printf '%s' "$ver"
+            return 0
+        fi
+    done <<< "$(installed_versions "$1")"
+    return 0
+}
+
+# Abort if a binary name is already taken by something this package does not own.
+check_link_conflicts() {  # <pkg> <binary names (space/newline separated)>
+    local pkg=$1 b link
+    set -f
+    for b in $2; do
+        link="$BIN_DIR/$b"
+        if [ -L "$link" ]; then
+            points_into "$link" "$PACKAGES_DIR/$pkg" \
+                || die "'$b' already exists in $BIN_DIR and points to $(readlink "$link") (not managed by '$pkg')."
+        elif [ -e "$link" ]; then
+            die "'$link' already exists and is not a symlink created by pkm."
+        fi
+    done
+    set +f
+    return 0
+}
+
+unlink_package_bins() {  # <pkg>: remove every symlink in BIN_DIR owned by pkg
+    local l
+    for l in "$BIN_DIR"/*; do
+        [ -L "$l" ] || continue
+        if points_into "$l" "$PACKAGES_DIR/$1"; then
+            rm -f -- "$l"
+        fi
+    done
+    return 0
+}
+
+link_version() {  # <pkg> <ver>
+    local dir="$PACKAGES_DIR/$1/$2" rel
+    while IFS= read -r rel || [ -n "$rel" ]; do
+        [ -n "$rel" ] || continue
+        ln -sfn "$dir/$rel" "$BIN_DIR/${rel##*/}"
+    done < "$dir/.pkm-bins"
+    return 0
+}
+
+# ==========================================
+# RECIPE PARSING (data only, never sourced)
+# ==========================================
+# Sets PV to the parsed value: "double", 'single' or bare (ends at whitespace).
+parse_value() {
+    local v=$1
+    v=${v#"${v%%[![:space:]]*}"}
+    case "$v" in
+        \"*) v=${v#\"}; v=${v%%\"*} ;;
+        \'*) v=${v#\'}; v=${v%%\'*} ;;
+        *)   v=${v%%[[:space:]]*} ;;
+    esac
+    PV=${v//[[:cntrl:]]/}
+}
+
+# Only these placeholders are expanded: ${VERSION} ${NAME} ${OS} ${ARCH}
+expand_vars() {
+    local s=$1 tok
+    tok='${VERSION}'; s=${s//"$tok"/$R_VERSION}
+    tok='${NAME}';    s=${s//"$tok"/$R_NAME}
+    tok='${OS}';      s=${s//"$tok"/$OS}
+    tok='${ARCH}';    s=${s//"$tok"/$ARCH}
+    printf '%s' "$s"
+}
+
+parse_recipe() {  # <file>
+    local line key
+    local re='^[[:space:]]*([A-Za-z][A-Za-z0-9_]*)=(.*)$'
+
+    R_NAME="" R_VERSION="" R_DESC="" R_BINS="" R_PLATFORMS=""
+    R_GURL="" R_GSUM="" R_GTYPE="" R_PURL="" R_PSUM="" R_PTYPE=""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        [[ "$line" =~ $re ]] || continue
+        key=${BASH_REMATCH[1]}
+        parse_value "${BASH_REMATCH[2]}"
+        case "$key" in
+            NAME)          R_NAME=$PV ;;
+            VERSION)       R_VERSION=$PV ;;
+            DESCRIPTION)   R_DESC=$PV ;;
+            BINARY_NAME)   R_BINS=$PV ;;
+            TYPE)          R_GTYPE=$PV ;;
+            URL)           R_GURL=$PV ;;
+            CHECKSUM)      R_GSUM=$PV ;;
+            "URL_${OS}_${ARCH}")      R_PURL=$PV; R_PLATFORMS="$R_PLATFORMS ${key#URL_}" ;;
+            "CHECKSUM_${OS}_${ARCH}") R_PSUM=$PV ;;
+            "TYPE_${OS}_${ARCH}")     R_PTYPE=$PV ;;
+            URL_*)         R_PLATFORMS="$R_PLATFORMS ${key#URL_}" ;;
+        esac
+    done < "$1"
+    return 0
+}
+
+validate_recipe() {  # <pkg>
+    local pkg=$1 b
+    [ -n "$R_NAME" ] || die "Recipe '$pkg' is missing NAME."
+    validate_name "$R_NAME" "NAME in recipe '$pkg'"
+    [ "$R_NAME" = "$pkg" ] \
+        || die "Recipe '$pkg': NAME ('$R_NAME') must match the recipe file name."
+    [ -n "$R_VERSION" ] || die "Recipe '$pkg' is missing VERSION."
+    validate_name "$R_VERSION" "VERSION in recipe '$pkg'"
+    if [ -z "$R_BINS" ]; then
+        R_BINS=$R_NAME
+    fi
+    set -f
+    for b in $R_BINS; do
+        validate_name "$b" "BINARY_NAME in recipe '$pkg'"
+    done
+    set +f
+    return 0
+}
+
+load_recipe() {  # <pkg>: parse + validate or die
+    local pkg=$1 file
+    validate_name "$pkg" "package name"
+    file="$RECIPES_DIR/$pkg.sh"
+    [ -f "$file" ] || die "Recipe not found: $pkg (looked in $RECIPES_DIR)"
+    parse_recipe "$file"
+    validate_recipe "$pkg"
+}
+
+recipe_version() {  # <pkg>: for use inside $(...)
+    load_recipe "$1"
+    printf '%s' "$R_VERSION"
+}
+
+# Picks the download for this OS/arch. Returns 1 (and sets R_ERR) if it cannot be used.
+resolve_download() {
+    local path
+    R_ERR=""; DL_URL=""; DL_SUM=""; DL_TYPE=""
+
+    if [ -n "$R_PURL" ]; then
+        DL_URL=$R_PURL; DL_SUM=$R_PSUM; DL_TYPE=${R_PTYPE:-$R_GTYPE}
+    elif [ -n "$R_GURL" ]; then
+        DL_URL=$R_GURL; DL_SUM=$R_GSUM; DL_TYPE=$R_GTYPE
+    else
+        R_ERR="Recipe has no download URL for platform ${OS}_${ARCH}"
+        return 1
+    fi
+
+    DL_URL=$(expand_vars "$DL_URL")
+    case "$DL_URL" in
+        https://?*) ;;
+        *) R_ERR="URL must start with https:// (got: $DL_URL)"; return 1 ;;
+    esac
+    case "$DL_URL" in
+        *[[:space:]]*) R_ERR="URL contains whitespace"; return 1 ;;
+    esac
+
+    DL_SUM=$(printf '%s' "$DL_SUM" | tr '[:upper:]' '[:lower:]')
+    if [ -z "$DL_SUM" ]; then
+        R_ERR="Recipe has no SHA-256 CHECKSUM for ${OS}_${ARCH}; refusing to install unverified code"
+        return 1
+    fi
+    if ! [[ "$DL_SUM" =~ $SHA_RE ]]; then
+        R_ERR="CHECKSUM must be exactly 64 hexadecimal characters"
+        return 1
+    fi
+
+    if [ -z "$DL_TYPE" ]; then
+        path=${DL_URL%%[?#]*}
+        case "$path" in
+            *.zip)            DL_TYPE="zip" ;;
+            *.tar.gz|*.tgz)   DL_TYPE="tar.gz" ;;
+            *.tar.xz|*.txz)   DL_TYPE="tar.xz" ;;
+            *.tar.bz2|*.tbz2) DL_TYPE="tar.bz2" ;;
+            *.tar)            DL_TYPE="tar" ;;
+            *) R_ERR="Cannot infer TYPE from the URL; set TYPE in the recipe"; return 1 ;;
+        esac
+    fi
+    case "$DL_TYPE" in
+        zip|tar|tar.gz|tgz|tar.xz|txz|tar.bz2|tbz2|binary) ;;
+        *) R_ERR="Unsupported TYPE: '$DL_TYPE'"; return 1 ;;
+    esac
+    return 0
 }
 
 # ==========================================
@@ -54,165 +463,595 @@ check_path() {
 
 # 1. Install package
 install_package() {
-    local PKG_NAME=$1
+    local pkg=${1:-} pkg_dir install_dir b found rel
+    [ -n "$pkg" ] || die "Usage: pkm install <package_name>"
 
-    if [ -z "$PKG_NAME" ]; then
-        log_error "Usage: pkm install <package_name>"
-        exit 1
+    load_recipe "$pkg"
+    resolve_download || die "$R_ERR"
+
+    pkg_dir="$PACKAGES_DIR/$R_NAME"
+    install_dir="$pkg_dir/$R_VERSION"
+
+    if [ -e "$install_dir" ] && [ "$FORCE" != 1 ]; then
+        die "$R_NAME $R_VERSION is already installed. Use 'pkm switch $R_NAME $R_VERSION' to activate it, or --force to reinstall."
+    fi
+    check_link_conflicts "$R_NAME" "$R_BINS"
+
+    need_cmd curl
+    need_cmd find
+    have_sha256_tool || die "No SHA-256 tool found (need sha256sum, shasum or openssl)."
+    case "$DL_TYPE" in
+        zip)    need_cmd unzip ;;
+        binary) ;;
+        *)      need_cmd tar ;;
+    esac
+
+    if [ "$DRY_RUN" = 1 ]; then
+        log_info "[dry-run] Would install $R_NAME $R_VERSION"
+        printf '  URL:       %s\n  SHA-256:   %s\n  Type:      %s\n  Binaries:  %s\n' \
+            "$DL_URL" "$DL_SUM" "$DL_TYPE" "$R_BINS"
+        return 0
     fi
 
-    local RECIPE="$RECIPES_DIR/$PKG_NAME.sh"
+    mkdir -p "$pkg_dir"
+    TEMP_FILE=$(mktemp "${TMPDIR:-/tmp}/pkm_dl_XXXXXX")
+    STAGE=$(mktemp -d "$pkg_dir/.stage.XXXXXX")
 
-    if [ ! -f "$RECIPE" ]; then
-        log_error "Recipe file not found: $RECIPE"
-        exit 1
+    log_info "Downloading $R_NAME version $R_VERSION..."
+    if ! curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --connect-timeout 15 --retry 3 -o "$TEMP_FILE" --url "$DL_URL"; then
+        die "Failed to download from URL: $DL_URL"
     fi
 
-    # Initialize empty variables to avoid unbound variable errors
-    NAME="" VERSION="" URL="" TYPE="" BINARY_NAME=""
-    
-    # Source the recipe
-    source "$RECIPE"
-
-    # Check recipe integrity
-    if [ -z "$NAME" ] || [ -z "$VERSION" ] || [ -z "$URL" ] || [ -z "$BINARY_NAME" ]; then
-        log_error "Recipe '$PKG_NAME.sh' is missing required fields (NAME, VERSION, URL, BINARY_NAME)."
+    log_info "Verifying SHA-256 checksum..."
+    local got
+    got=$(sha256_of "$TEMP_FILE" | tr '[:upper:]' '[:lower:]')
+    if [ "$got" != "$DL_SUM" ]; then
+        log_error "Checksum verification failed!"
+        printf '   Expected: %s\n   Got:      %s\n' "$DL_SUM" "$got" >&2
         exit 1
     fi
-
-    local INSTALL_DIR="$PACKAGES_DIR/$NAME/$VERSION"
-    TEMP_FILE=$(mktemp /tmp/pkm_${NAME}_XXXXXX)
-
-    log_info "Downloading $NAME version $VERSION..."
-    mkdir -p "$INSTALL_DIR"
-    
-    if ! curl -fsSL -o "$TEMP_FILE" "$URL"; then
-        log_error "Failed to download from URL: $URL"
-        rm -rf "$INSTALL_DIR" # Remove empty directory on download failure
-        exit 1
-    fi
+    log_success "Checksum verified successfully!"
 
     log_info "Extracting files..."
-    case "$TYPE" in
+    case "$DL_TYPE" in
         zip)
-            unzip -o -q "$TEMP_FILE" -d "$INSTALL_DIR"
-            ;;
-        tar.gz|tgz)
-            tar -xzf "$TEMP_FILE" -C "$INSTALL_DIR"
+            unzip -q "$TEMP_FILE" -d "$STAGE"
             ;;
         binary)
-            mv "$TEMP_FILE" "$INSTALL_DIR/$BINARY_NAME"
+            set -- $R_BINS
+            [ "$#" -eq 1 ] || die "TYPE=binary supports exactly one BINARY_NAME."
+            mv "$TEMP_FILE" "$STAGE/$1"
+            TEMP_FILE=""
             ;;
         *)
-            log_error "Unsupported archive type: '$TYPE'"
-            rm -rf "$INSTALL_DIR"
-            exit 1
+            tar -xf "$TEMP_FILE" -C "$STAGE"
             ;;
     esac
 
-    local TARGET_BIN
-    TARGET_BIN=$(find "$INSTALL_DIR" -type f -name "$BINARY_NAME" | head -n 1)
+    # Never trust metadata names that may come from the archive itself.
+    rm -f -- "$STAGE/.pkm-bins" "$STAGE/.pkm-meta"
+    : > "$STAGE/.pkm-bins"
+    for b in $R_BINS; do
+        found=$(find "$STAGE" -type f -name "$b" | sort | sed -n '1p')
+        [ -n "$found" ] || die "Binary '$b' not found in extracted files."
+        chmod +x "$found"
+        rel=${found#"$STAGE"/}
+        printf '%s\n' "$rel" >> "$STAGE/.pkm-bins"
+    done
+    {
+        printf 'NAME=%s\n' "$R_NAME"
+        printf 'VERSION=%s\n' "$R_VERSION"
+        printf 'URL=%s\n' "$DL_URL"
+        printf 'CHECKSUM=%s\n' "$DL_SUM"
+        printf 'INSTALLED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$STAGE/.pkm-meta"
 
-    if [ -z "$TARGET_BIN" ]; then
-        log_error "Binary '$BINARY_NAME' not found in extracted files."
-        exit 1
+    # Atomic switch-over: the version directory only appears once it is complete.
+    if [ -e "$install_dir" ]; then
+        safe_rm_rf "$install_dir"
     fi
+    mv "$STAGE" "$install_dir"
+    STAGE=""
 
-    log_info "Creating symlink..."
-    chmod +x "$TARGET_BIN"
-    ln -sf "$TARGET_BIN" "$BIN_DIR/$BINARY_NAME"
+    log_info "Creating symlinks..."
+    unlink_package_bins "$R_NAME"
+    link_version "$R_NAME" "$R_VERSION"
 
-    log_success "Successfully installed $NAME ($VERSION)!"
+    log_success "Successfully installed $R_NAME ($R_VERSION)!"
     check_path
 }
 
 # 2. Switch version
 switch_version() {
-    local PKG_NAME=$1
-    local TARGET_VER=$2
+    local pkg=${1:-} ver=${2:-} dir bins
+    if [ -z "$pkg" ] || [ -z "$ver" ]; then
+        die "Usage: pkm switch <package_name> <version>"
+    fi
+    validate_name "$pkg" "package name"
+    validate_name "$ver" "version"
 
-    if [ -z "$PKG_NAME" ] || [ -z "$TARGET_VER" ]; then
-        log_error "Usage: pkm switch <package_name> <version>"
-        exit 1
+    dir="$PACKAGES_DIR/$pkg/$ver"
+    [ -d "$dir" ] || die "Version '$ver' of '$pkg' is not installed."
+    [ -f "$dir/.pkm-bins" ] || die "Metadata missing for $pkg $ver. Reinstall with: pkm install --force $pkg"
+
+    if is_active "$pkg" "$ver"; then
+        log_info "$pkg is already at version $ver."
+        return 0
     fi
 
-    local TARGET_DIR="$PACKAGES_DIR/$PKG_NAME/$TARGET_VER"
+    bins=$(version_bins "$dir")
+    check_link_conflicts "$pkg" "$bins"
 
-    if [ ! -d "$TARGET_DIR" ]; then
-        log_error "Version '$TARGET_VER' of '$PKG_NAME' is not installed."
-        exit 1
+    if [ "$DRY_RUN" = 1 ]; then
+        log_info "[dry-run] Would switch $pkg to version $ver"
+        return 0
     fi
 
-    local RECIPE="$RECIPES_DIR/$PKG_NAME.sh"
-    local BINARY_NAME=""
-    
-    [ -f "$RECIPE" ] && source "$RECIPE"
-    [ -z "$BINARY_NAME" ] && BINARY_NAME="$PKG_NAME"
-
-    local TARGET_BIN
-    TARGET_BIN=$(find "$TARGET_DIR" -type f -name "$BINARY_NAME" | head -n 1)
-
-    if [ -z "$TARGET_BIN" ]; then
-        log_error "Executable binary '$BINARY_NAME' not found in $TARGET_DIR."
-        exit 1
-    fi
-
-    ln -sf "$TARGET_BIN" "$BIN_DIR/$BINARY_NAME"
-    log_success "Successfully switched $PKG_NAME to version $TARGET_VER!"
+    unlink_package_bins "$pkg"
+    link_version "$pkg" "$ver"
+    log_success "Successfully switched $pkg to version $ver!"
 }
 
 # 3. List installed packages
 list_packages() {
+    local pkg_dir pkg ver found=0 mark when dir
     log_info "Installed packages:"
-    if [ ! -d "$PACKAGES_DIR" ] || [ -z "$(ls -A "$PACKAGES_DIR")" ]; then
-        echo " (No packages installed yet)"
-        return
+    for pkg_dir in "$PACKAGES_DIR"/*/; do
+        [ -d "$pkg_dir" ] || continue
+        pkg=${pkg_dir%/}
+        pkg=${pkg##*/}
+        found=1
+        printf '📦 %s%s%s:\n' "$GREEN" "$pkg" "$NC"
+        while IFS= read -r ver; do
+            [ -n "$ver" ] || continue
+            dir="$PACKAGES_DIR/$pkg/$ver"
+            mark=""
+            if is_active "$pkg" "$ver"; then
+                mark=" ${CYAN}(active)${NC}"
+            fi
+            when=$(meta_get "$dir" INSTALLED_AT)
+            printf '   - %s%s%s\n' "$ver" "$mark" "${when:+  [installed $when]}"
+        done <<< "$(installed_versions "$pkg")"
+    done
+    if [ "$found" = 0 ]; then
+        printf ' (No packages installed yet)\n'
+    fi
+    return 0
+}
+
+# 4. Remove package
+remove_package() {
+    local pkg=${1:-} ver=${2:-} pkg_dir dir was_active=0 left
+    [ -n "$pkg" ] || die "Usage: pkm remove <package_name> [version]"
+    validate_name "$pkg" "package name"
+
+    pkg_dir="$PACKAGES_DIR/$pkg"
+    [ -d "$pkg_dir" ] || die "Package '$pkg' is not installed."
+
+    if [ -n "$ver" ]; then
+        validate_name "$ver" "version"
+        dir="$pkg_dir/$ver"
+        [ -d "$dir" ] || die "Version '$ver' of '$pkg' is not installed."
+        if is_active "$pkg" "$ver"; then
+            was_active=1
+        fi
+
+        if [ "$DRY_RUN" = 1 ]; then
+            log_info "[dry-run] Would remove $pkg $ver"
+            return 0
+        fi
+        confirm "Remove $pkg $ver?" || { log_info "Cancelled."; return 0; }
+
+        if [ "$was_active" = 1 ]; then
+            unlink_package_bins "$pkg"
+        fi
+        safe_rm_rf "$dir"
+        log_success "Removed version $ver of $pkg."
+
+        left=$(installed_versions "$pkg")
+        if [ -z "$left" ]; then
+            unlink_package_bins "$pkg"
+            safe_rm_rf "$pkg_dir"
+            log_info "No versions left, removed $pkg completely."
+        elif [ "$was_active" = 1 ]; then
+            log_warn "The active version was removed. Use 'pkm switch $pkg <version>' to activate another one."
+        fi
+    else
+        if [ "$DRY_RUN" = 1 ]; then
+            log_info "[dry-run] Would remove $pkg (all versions)"
+            return 0
+        fi
+        confirm "Remove $pkg and ALL its installed versions?" || { log_info "Cancelled."; return 0; }
+        unlink_package_bins "$pkg"
+        safe_rm_rf "$pkg_dir"
+        log_success "Completely removed $pkg!"
+    fi
+}
+
+# 5. Search recipes (matches name or description)
+search_package() {
+    local kw=${1:-} found=0 recipe pkg hay
+    kw=$(printf '%s' "$kw" | tr '[:upper:]' '[:lower:]')
+    log_info "Available recipes:"
+
+    for recipe in "$RECIPES_DIR"/*.sh; do
+        [ -e "$recipe" ] || continue
+        pkg=${recipe##*/}
+        pkg=${pkg%.sh}
+        is_valid_name "$pkg" || continue
+        parse_recipe "$recipe"
+
+        if [ -n "$kw" ]; then
+            hay=$(printf '%s %s' "$pkg" "$R_DESC" | tr '[:upper:]' '[:lower:]')
+            case "$hay" in
+                *"$kw"*) ;;
+                *) continue ;;
+            esac
+        fi
+
+        printf ' 🔍 %s%s%s' "$GREEN" "$pkg" "$NC"
+        if [ -n "$R_VERSION" ]; then
+            printf ' (%s)' "$R_VERSION"
+        fi
+        if [ -n "$R_DESC" ]; then
+            printf ' - %s' "$R_DESC"
+        fi
+        printf '\n'
+        found=1
+    done
+
+    if [ "$found" = 0 ]; then
+        log_warn "No recipes found${kw:+ matching '$kw'}."
+    fi
+    return 0
+}
+
+# 6. Show package info
+info_package() {
+    local pkg=${1:-} ver any=0 mark dir when
+    [ -n "$pkg" ] || die "Usage: pkm info <package_name>"
+    load_recipe "$pkg"
+    resolve_download || true
+
+    printf '%s=== Package Info: %s ===%s\n' "$BLUE" "$pkg" "$NC"
+    printf '%sName:%s        %s\n' "$YELLOW" "$NC" "$R_NAME"
+    printf '%sVersion:%s     %s\n' "$YELLOW" "$NC" "$R_VERSION"
+    printf '%sDescription:%s %s\n' "$YELLOW" "$NC" "${R_DESC:-No description provided}"
+    printf '%sBinaries:%s    %s\n' "$YELLOW" "$NC" "$R_BINS"
+    printf '%sPlatform:%s    %s_%s\n' "$YELLOW" "$NC" "$OS" "$ARCH"
+    if [ -n "$R_PLATFORMS" ]; then
+        printf '%sSupported:%s   %s\n' "$YELLOW" "$NC" "${R_PLATFORMS# }"
+    fi
+    printf '%sType:%s        %s\n' "$YELLOW" "$NC" "${DL_TYPE:--}"
+    printf '%sURL:%s         %s\n' "$YELLOW" "$NC" "${DL_URL:--}"
+    if [ -n "$DL_SUM" ]; then
+        printf '%sChecksum:%s    %s (SHA-256)\n' "$YELLOW" "$NC" "$DL_SUM"
+    else
+        printf '%sChecksum:%s    %sMISSING%s\n' "$YELLOW" "$NC" "$RED" "$NC"
+    fi
+    if [ -n "$R_ERR" ]; then
+        printf '%sInstall blocked:%s %s\n' "$RED" "$NC" "$R_ERR"
     fi
 
-    for pkg in "$PACKAGES_DIR"/*; do
-        if [ -d "$pkg" ]; then
-            local pkg_name=$(basename "$pkg")
-            echo -e "📦 ${GREEN}$pkg_name${NC}:"
-            for ver in "$pkg"/*; do
-                if [ -d "$ver" ]; then
-                    local ver_name=$(basename "$ver")
-                    echo "   - $ver_name"
-                fi
-            done
+    printf '\n%sInstalled versions:%s\n' "$YELLOW" "$NC"
+    while IFS= read -r ver; do
+        [ -n "$ver" ] || continue
+        any=1
+        dir="$PACKAGES_DIR/$pkg/$ver"
+        mark=""
+        if is_active "$pkg" "$ver"; then
+            mark=" ${CYAN}(active)${NC}"
+        fi
+        when=$(meta_get "$dir" INSTALLED_AT)
+        printf '  - %s%s%s\n' "$ver" "$mark" "${when:+  [installed $when]}"
+    done <<< "$(installed_versions "$pkg")"
+    if [ "$any" = 0 ]; then
+        printf '  (not installed)\n'
+    fi
+    return 0
+}
+
+# 7. Update recipes repository
+update_recipes() {
+    if [ ! -e "$RECIPES_DIR/.git" ]; then
+        log_warn "The recipes directory is not a Git repository."
+        log_info "To enable updates, run:"
+        printf '  git clone <your-recipes-repo-url> %s\n' "$RECIPES_DIR"
+        printf '  (or: cd %s && git init && git remote add origin <url> && git fetch && git branch --set-upstream-to=origin/<branch>)\n' "$RECIPES_DIR"
+        return 1
+    fi
+    need_cmd git
+
+    git -C "$RECIPES_DIR" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 \
+        || die "No upstream branch configured. Run: git -C $RECIPES_DIR branch --set-upstream-to=origin/<branch>"
+
+    if [ "$DRY_RUN" = 1 ]; then
+        log_info "[dry-run] Would fetch and fast-forward $RECIPES_DIR"
+        return 0
+    fi
+
+    log_info "Updating recipes repository..."
+    git -C "$RECIPES_DIR" fetch --quiet
+    if [ "${PKM_REQUIRE_SIGNED:-0}" = 1 ]; then
+        log_info "Verifying GPG/SSH signature of the new commit..."
+        git -C "$RECIPES_DIR" verify-commit '@{u}' \
+            || die "Signature verification failed; recipes were NOT updated."
+    fi
+    git -C "$RECIPES_DIR" merge --ff-only --quiet '@{u}'
+    log_success "Recipes updated successfully!"
+}
+
+# 8. Show packages whose recipe version is not installed
+outdated_packages() {
+    local pkg_dir pkg ver active found=0
+    for pkg_dir in "$PACKAGES_DIR"/*/; do
+        [ -d "$pkg_dir" ] || continue
+        pkg=${pkg_dir%/}
+        pkg=${pkg##*/}
+        if ! ver=$(recipe_version "$pkg" 2>/dev/null); then
+            log_warn "$pkg: no valid recipe, skipped."
+            continue
+        fi
+        if [ ! -d "$PACKAGES_DIR/$pkg/$ver" ]; then
+            active=$(active_version "$pkg")
+            printf '📦 %s%s%s: %s -> %s%s%s\n' "$GREEN" "$pkg" "$NC" "${active:-none active}" "$GREEN" "$ver" "$NC"
+            found=1
         fi
     done
+    if [ "$found" = 0 ]; then
+        log_success "All installed packages match their recipes."
+    fi
+    return 0
+}
+
+# 9. Upgrade (install the recipe version when it is newer than what is installed)
+upgrade_one() {  # <pkg>
+    local pkg=$1 ver active
+    validate_name "$pkg" "package name"
+    if [ ! -d "$PACKAGES_DIR/$pkg" ]; then
+        log_warn "$pkg is not installed (use 'pkm install $pkg')."
+        return 0
+    fi
+    if ! ver=$(recipe_version "$pkg"); then
+        log_warn "Skipping $pkg because its recipe is invalid."
+        return 0
+    fi
+    if [ -d "$PACKAGES_DIR/$pkg/$ver" ]; then
+        log_success "$pkg is up to date ($ver)."
+        return 0
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        active=$(active_version "$pkg")
+        log_info "[dry-run] Would upgrade $pkg: ${active:-none active} -> $ver"
+        return 0
+    fi
+    log_info "Upgrading $pkg to $ver..."
+    # Separate process: it takes the lock and cleans up after itself.
+    "$BASH" "$SELF" install "$pkg" || log_warn "Upgrade of $pkg failed."
+    return 0
+}
+
+upgrade_packages() {
+    local pkg_dir pkg
+    if [ -n "${1:-}" ]; then
+        upgrade_one "$1"
+        return 0
+    fi
+    for pkg_dir in "$PACKAGES_DIR"/*/; do
+        [ -d "$pkg_dir" ] || continue
+        pkg=${pkg_dir%/}
+        pkg=${pkg##*/}
+        upgrade_one "$pkg"
+    done
+    return 0
+}
+
+# 10. Which package provides a binary?
+which_binary() {
+    local name=${1:-} link target rest pkg ver
+    [ -n "$name" ] || die "Usage: pkm which <binary_name>"
+    validate_name "$name" "binary name"
+    link="$BIN_DIR/$name"
+    [ -L "$link" ] || die "'$name' is not a pkm-managed binary."
+    target=$(readlink "$link")
+    case "$target" in
+        "$PACKAGES_DIR"/*) ;;
+        *) die "'$name' points to $target, which is outside pkm packages." ;;
+    esac
+    rest=${target#"$PACKAGES_DIR"/}
+    pkg=${rest%%/*}
+    rest=${rest#*/}
+    ver=${rest%%/*}
+    printf '%s -> %s%s%s %s (%s)\n' "$name" "$GREEN" "$pkg" "$NC" "$ver" "$target"
+}
+
+# 11. Diagnose problems
+run_doctor() {
+    local issues=0 t l pkg_dir pkg ver dir rel d pid
+    log_info "PKM diagnostics (platform: ${OS}_${ARCH})"
+
+    for t in curl find tar; do
+        if ! command -v "$t" >/dev/null 2>&1; then
+            log_error "Missing required tool: $t"
+            issues=$((issues + 1))
+        fi
+    done
+    if ! have_sha256_tool; then
+        log_error "No SHA-256 tool found (sha256sum / shasum / openssl)."
+        issues=$((issues + 1))
+    fi
+    for t in unzip git; do
+        if ! command -v "$t" >/dev/null 2>&1; then
+            log_warn "Optional tool missing: $t (needed for zip recipes / 'pkm update')."
+        fi
+    done
+
+    if ! path_has_bin_dir; then
+        log_warn "$BIN_DIR is not in your PATH."
+        issues=$((issues + 1))
+    fi
+
+    for l in "$BIN_DIR"/*; do
+        [ -L "$l" ] || continue
+        if points_into "$l" "$PACKAGES_DIR" && [ ! -e "$l" ]; then
+            log_warn "Broken symlink: $l -> $(readlink "$l")"
+            issues=$((issues + 1))
+        fi
+    done
+
+    for pkg_dir in "$PACKAGES_DIR"/*/; do
+        [ -d "$pkg_dir" ] || continue
+        pkg=${pkg_dir%/}
+        pkg=${pkg##*/}
+        while IFS= read -r ver; do
+            [ -n "$ver" ] || continue
+            dir="$PACKAGES_DIR/$pkg/$ver"
+            if [ ! -f "$dir/.pkm-bins" ]; then
+                log_warn "$pkg $ver has no .pkm-bins metadata (reinstall with --force)."
+                issues=$((issues + 1))
+                continue
+            fi
+            while IFS= read -r rel || [ -n "$rel" ]; do
+                [ -n "$rel" ] || continue
+                if [ ! -x "$dir/$rel" ]; then
+                    log_warn "$pkg $ver: '$rel' is missing or not executable."
+                    issues=$((issues + 1))
+                fi
+            done < "$dir/.pkm-bins"
+        done <<< "$(installed_versions "$pkg")"
+
+        for d in "$pkg_dir".stage.*; do
+            [ -d "$d" ] || continue
+            log_warn "Leftover staging directory (interrupted install): $d"
+            issues=$((issues + 1))
+        done
+    done
+
+    if [ -d "$LOCK_DIR" ]; then
+        pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+        if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+            log_warn "Stale lock found at $LOCK_DIR (remove it manually)."
+            issues=$((issues + 1))
+        fi
+    fi
+
+    if [ "$issues" -eq 0 ]; then
+        log_success "No problems found."
+        return 0
+    fi
+    log_error "$issues problem(s) found."
+    return 1
 }
 
 # ==========================================
 # CLI ROUTING (MAIN)
 # ==========================================
 show_help() {
-    echo -e "${YELLOW}PKM (Personal Package Manager)${NC}"
-    echo "Usage:"
-    echo "  pkm install <pkg_name>       Install a package from recipe"
-    echo "  pkm switch <pkg_name> <ver>  Switch package version"
-    echo "  pkm list                     List all installed packages"
-    echo "  pkm help                     Show this help menu"
+    cat <<EOF
+${CYAN}PKM (Personal Package Manager) v${PKM_VERSION}${NC}
+
+Usage: pkm [options] <command> [args]
+
+Commands:
+  ${GREEN}install <pkg>${NC}            Install the version defined in the recipe
+  ${GREEN}upgrade [pkg]${NC}            Install newer recipe versions (all packages if none given)
+  ${GREEN}outdated${NC}                 Show packages whose recipe version is not installed
+  ${GREEN}switch <pkg> <ver>${NC}       Activate an installed version
+  ${GREEN}remove <pkg> [ver]${NC}       Remove a package (or one specific version)
+  ${GREEN}list${NC}                     List installed packages and versions
+  ${GREEN}search [keyword]${NC}         Search recipes by name or description
+  ${GREEN}info <pkg>${NC}               Show recipe details and installed versions
+  ${GREEN}which <binary>${NC}           Show which package provides a binary
+  ${GREEN}update${NC}                   Sync recipes via Git (fast-forward only)
+  ${GREEN}doctor${NC}                   Check for broken links, leftovers and missing tools
+  ${GREEN}help${NC}                     Show this help
+
+Options:
+  -y, --yes       Do not ask for confirmation
+  -n, --dry-run   Show what would happen without changing anything
+  -f, --force     Reinstall a version that is already installed
+  -h, --help      Show this help
+
+Environment:
+  PKM_DIR             Base directory (default: \$HOME/.pkm)
+  PKM_REQUIRE_SIGNED  Set to 1 so 'update' only accepts signed commits
+  NO_COLOR            Disable colored output
+
+EOF
+    cat <<'EOF'
+Recipe format (~/.pkm/recipes/<name>.sh) - plain KEY=value lines, NEVER executed:
+
+  NAME="ripgrep"                 # must equal the file name (ripgrep.sh)
+  VERSION="14.1.0"
+  DESCRIPTION="Fast recursive grep"
+  BINARY_NAME="rg"               # one or more names, space separated (default: NAME)
+  TYPE="tar.gz"                  # zip|tar|tar.gz|tar.xz|tar.bz2|binary (default: from URL)
+
+  # Per-platform download (OS = linux|darwin, ARCH = x86_64|arm64|armv7|x86):
+  URL_linux_x86_64="https://example.com/rg-${VERSION}-linux-x86_64.tar.gz"
+  CHECKSUM_linux_x86_64="<64 hex chars, SHA-256>"
+  URL_darwin_arm64="https://example.com/rg-${VERSION}-darwin-arm64.tar.gz"
+  CHECKSUM_darwin_arm64="<64 hex chars, SHA-256>"
+
+  # Or a generic fallback used when no platform entry matches:
+  # URL="https://..."
+  # CHECKSUM="<64 hex chars>"
+
+Only HTTPS URLs are accepted and a CHECKSUM is mandatory.
+Allowed placeholders: ${VERSION} ${NAME} ${OS} ${ARCH}
+EOF
 }
 
-COMMAND=${1:-"help"}
+main() {
+    local pos=0 a CMD="" ARG1="" ARG2=""
 
-case "$COMMAND" in
-    install)
-        install_package "$2"
-        ;;
-    switch)
-        switch_version "$2" "$3"
-        ;;
-    list)
-        list_packages
-        ;;
-    help)
+    for a in "$@"; do
+        case "$a" in
+            -y|--yes)     ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -f|--force)   FORCE=1 ;;
+            -h|--help)    show_help; exit 0 ;;
+            -*)           die "Unknown option: $a (see 'pkm help')" ;;
+            *)
+                pos=$((pos + 1))
+                case "$pos" in
+                    1) CMD=$a ;;
+                    2) ARG1=$a ;;
+                    3) ARG2=$a ;;
+                    *) die "Too many arguments (see 'pkm help')" ;;
+                esac
+                ;;
+        esac
+    done
+    CMD=${CMD:-help}
+
+    if [ "$CMD" = "help" ]; then
         show_help
-        ;;
-    *)
-        log_error "Invalid command: '$COMMAND'."
-        show_help
-        exit 1
-        ;;
-esac
+        exit 0
+    fi
+
+    detect_platform
+    mkdir -p "$RECIPES_DIR" "$PACKAGES_DIR" "$BIN_DIR"
+
+    case "$CMD" in
+        install)          lock_if_needed; install_package "$ARG1" ;;
+        upgrade)          upgrade_packages "$ARG1" ;;
+        outdated)         outdated_packages ;;
+        switch)           lock_if_needed; switch_version "$ARG1" "$ARG2" ;;
+        remove|uninstall) lock_if_needed; remove_package "$ARG1" "$ARG2" ;;
+        list|ls)          list_packages ;;
+        search)           search_package "$ARG1" ;;
+        info)             info_package "$ARG1" ;;
+        which)            which_binary "$ARG1" ;;
+        update)           lock_if_needed; update_recipes ;;
+        doctor)           run_doctor ;;
+        *)
+            log_error "Invalid command: '$CMD'."
+            show_help >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
