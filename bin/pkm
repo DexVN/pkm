@@ -1,151 +1,218 @@
 #!/usr/bin/env bash
 
+# Bash Strict Mode for better error handling
+set -eo pipefail
+
+# ==========================================
+# DIRECTORY CONFIGURATION
+# ==========================================
 PKM_DIR="$HOME/.pkm"
 RECIPES_DIR="$PKM_DIR/recipes"
 PACKAGES_DIR="$PKM_DIR/packages"
 BIN_DIR="$PKM_DIR/bin"
 
+# Create directories if they do not exist
+mkdir -p "$RECIPES_DIR" "$PACKAGES_DIR" "$BIN_DIR"
+
+# ==========================================
+# COLORS & UI
+# ==========================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No color
+
+log_info() { echo -e "${BLUE}ℹ️ $1${NC}"; }
+log_success() { echo -e "${GREEN}✅ $1${NC}"; }
+log_warn() { echo -e "${YELLOW}⚠️ $1${NC}"; }
+log_error() { echo -e "${RED}❌ $1${NC}"; }
+
+# ==========================================
+# CLEANUP & SYSTEM CHECKS
+# ==========================================
+TEMP_FILE=""
+
+cleanup() {
+    if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
+        rm -f "$TEMP_FILE"
+    fi
+}
+trap cleanup EXIT
+
+check_path() {
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+        log_warn "Directory $BIN_DIR is not in your \$PATH."
+        log_warn "Please add the following line to your ~/.bashrc or ~/.zshrc:"
+        echo "export PATH=\"$BIN_DIR:\$PATH\""
+    fi
+}
+
+# ==========================================
+# MAIN FEATURES
+# ==========================================
+
 # 1. Install package
 install_package() {
-    PKG_NAME=$1
+    local PKG_NAME=$1
 
     if [ -z "$PKG_NAME" ]; then
-        echo "❌ Error: Usage: pkm install <package_name>"
+        log_error "Usage: pkm install <package_name>"
         exit 1
     fi
 
-    RECIPE="$RECIPES_DIR/$PKG_NAME.sh"
+    local RECIPE="$RECIPES_DIR/$PKG_NAME.sh"
 
     if [ ! -f "$RECIPE" ]; then
-        echo "❌ Error: Recipe for '$PKG_NAME' not found."
+        log_error "Recipe file not found: $RECIPE"
         exit 1
     fi
 
+    # Initialize empty variables to avoid unbound variable errors
+    NAME="" VERSION="" URL="" TYPE="" BINARY_NAME=""
+    
+    # Source the recipe
     source "$RECIPE"
 
-    INSTALL_DIR="$PACKAGES_DIR/$NAME/$VERSION"
-    TEMP_FILE="/tmp/${NAME}_download"
-
-    echo "📦 Downloading $NAME ($VERSION)..."
-    mkdir -p "$INSTALL_DIR"
-    curl -L -o "$TEMP_FILE" "$URL"
-
-    echo "📂 Extracting files..."
-    if [ "$TYPE" == "zip" ]; then
-        unzip -o -q "$TEMP_FILE" -d "$INSTALL_DIR"
-    elif [ "$TYPE" == "tar.gz" ] || [ "$TYPE" == "tgz" ]; then
-        tar -xzf "$TEMP_FILE" -C "$INSTALL_DIR"
-    elif [ "$TYPE" == "binary" ]; then
-        mv "$TEMP_FILE" "$INSTALL_DIR/$BINARY_NAME"
+    # Check recipe integrity
+    if [ -z "$NAME" ] || [ -z "$VERSION" ] || [ -z "$URL" ] || [ -z "$BINARY_NAME" ]; then
+        log_error "Recipe '$PKG_NAME.sh' is missing required fields (NAME, VERSION, URL, BINARY_NAME)."
+        exit 1
     fi
 
-    rm -f "$TEMP_FILE"
+    local INSTALL_DIR="$PACKAGES_DIR/$NAME/$VERSION"
+    TEMP_FILE=$(mktemp /tmp/pkm_${NAME}_XXXXXX)
 
+    log_info "Downloading $NAME version $VERSION..."
+    mkdir -p "$INSTALL_DIR"
+    
+    if ! curl -fsSL -o "$TEMP_FILE" "$URL"; then
+        log_error "Failed to download from URL: $URL"
+        rm -rf "$INSTALL_DIR" # Remove empty directory on download failure
+        exit 1
+    fi
+
+    log_info "Extracting files..."
+    case "$TYPE" in
+        zip)
+            unzip -o -q "$TEMP_FILE" -d "$INSTALL_DIR"
+            ;;
+        tar.gz|tgz)
+            tar -xzf "$TEMP_FILE" -C "$INSTALL_DIR"
+            ;;
+        binary)
+            mv "$TEMP_FILE" "$INSTALL_DIR/$BINARY_NAME"
+            ;;
+        *)
+            log_error "Unsupported archive type: '$TYPE'"
+            rm -rf "$INSTALL_DIR"
+            exit 1
+            ;;
+    esac
+
+    local TARGET_BIN
     TARGET_BIN=$(find "$INSTALL_DIR" -type f -name "$BINARY_NAME" | head -n 1)
 
     if [ -z "$TARGET_BIN" ]; then
-        echo "❌ Error: Binary '$BINARY_NAME' not found in extracted files."
+        log_error "Binary '$BINARY_NAME' not found in extracted files."
         exit 1
     fi
 
-    echo "🔗 Creating symlink..."
+    log_info "Creating symlink..."
     chmod +x "$TARGET_BIN"
-    mkdir -p "$BIN_DIR"
     ln -sf "$TARGET_BIN" "$BIN_DIR/$BINARY_NAME"
 
-    echo "✅ Successfully installed $NAME ($VERSION)!"
+    log_success "Successfully installed $NAME ($VERSION)!"
+    check_path
 }
 
 # 2. Switch version
 switch_version() {
-    PKG_NAME=$1
-    TARGET_VER=$2
+    local PKG_NAME=$1
+    local TARGET_VER=$2
 
     if [ -z "$PKG_NAME" ] || [ -z "$TARGET_VER" ]; then
-        echo "❌ Error: Usage: pkm switch <package_name> <version>"
-        echo "💡 Example: pkm switch node 18.20.0"
+        log_error "Usage: pkm switch <package_name> <version>"
         exit 1
     fi
 
-    # Find recipe file to retrieve correct BINARY_NAME
-    RECIPE="$RECIPES_DIR/$PKG_NAME.sh"
-    if [ -f "$RECIPE" ]; then
-        source "$RECIPE"
-    else
-        BINARY_NAME="$PKG_NAME"
-    fi
+    local TARGET_DIR="$PACKAGES_DIR/$PKG_NAME/$TARGET_VER"
 
-    TARGET_BIN="$PACKAGES_DIR/$PKG_NAME/$TARGET_VER/$BINARY_NAME"
-
-    if [ -f "$TARGET_BIN" ]; then
-        ln -sf "$TARGET_BIN" "$BIN_DIR/$BINARY_NAME"
-        echo "🔄 Switched $PKG_NAME to version $TARGET_VER!"
-    else
-        echo "❌ Error: Version $TARGET_VER of $PKG_NAME is not installed at $PACKAGES_DIR/$PKG_NAME/"
-        echo "💡 Hint: Check installed versions using: ls $PACKAGES_DIR/$PKG_NAME"
-    fi
-}
-
-# 3. Remove package
-remove_package() {
-    PKG_NAME=$1
-    if [ -z "$PKG_NAME" ]; then
-        echo "❌ Error: Usage: pkm remove <package_name>"
+    if [ ! -d "$TARGET_DIR" ]; then
+        log_error "Version '$TARGET_VER' of '$PKG_NAME' is not installed."
         exit 1
     fi
 
-    RECIPE="$RECIPES_DIR/$PKG_NAME.sh"
-    if [ -f "$RECIPE" ]; then
-        source "$RECIPE"
-        echo "🗑️  Removing $NAME..."
-        rm -rf "$PACKAGES_DIR/$NAME"
-        rm -f "$BIN_DIR/$BINARY_NAME"
-        echo "✅ Successfully removed $NAME!"
-    else
-        echo "❌ Error: Package info for '$PKG_NAME' not found."
+    local RECIPE="$RECIPES_DIR/$PKG_NAME.sh"
+    local BINARY_NAME=""
+    
+    [ -f "$RECIPE" ] && source "$RECIPE"
+    [ -z "$BINARY_NAME" ] && BINARY_NAME="$PKG_NAME"
+
+    local TARGET_BIN
+    TARGET_BIN=$(find "$TARGET_DIR" -type f -name "$BINARY_NAME" | head -n 1)
+
+    if [ -z "$TARGET_BIN" ]; then
+        log_error "Executable binary '$BINARY_NAME' not found in $TARGET_DIR."
+        exit 1
     fi
+
+    ln -sf "$TARGET_BIN" "$BIN_DIR/$BINARY_NAME"
+    log_success "Successfully switched $PKG_NAME to version $TARGET_VER!"
 }
 
-# 4. List installed packages
+# 3. List installed packages
 list_packages() {
-    echo "📋 Installed packages via PKM:"
-    if [ -d "$PACKAGES_DIR" ] && [ "$(ls -A "$PACKAGES_DIR")" ]; then
-        for pkg in "$PACKAGES_DIR"/*; do
-            if [ -d "$pkg" ]; then
-                pkg_name=$(basename "$pkg")
-                versions=$(ls -1 "$pkg" | tr '\n' ' ')
-                echo "  • $pkg_name (Available versions: $versions)"
-            fi
-        done
-    else
-        echo "  (No packages installed)"
+    log_info "Installed packages:"
+    if [ ! -d "$PACKAGES_DIR" ] || [ -z "$(ls -A "$PACKAGES_DIR")" ]; then
+        echo " (No packages installed yet)"
+        return
     fi
+
+    for pkg in "$PACKAGES_DIR"/*; do
+        if [ -d "$pkg" ]; then
+            local pkg_name=$(basename "$pkg")
+            echo -e "📦 ${GREEN}$pkg_name${NC}:"
+            for ver in "$pkg"/*; do
+                if [ -d "$ver" ]; then
+                    local ver_name=$(basename "$ver")
+                    echo "   - $ver_name"
+                fi
+            done
+        fi
+    done
 }
 
-# 5. Update recipes from Git Remote
-update_pkm() {
-    echo "🔄 Updating recipes from GitHub..."
-    if [ -d "$PKM_DIR/.git" ]; then
-        git -C "$PKM_DIR" pull --quiet
-        echo "✅ Update complete!"
-    else
-        echo "❌ Error: $PKM_DIR is not a Git repository!"
-    fi
+# ==========================================
+# CLI ROUTING (MAIN)
+# ==========================================
+show_help() {
+    echo -e "${YELLOW}PKM (Personal Package Manager)${NC}"
+    echo "Usage:"
+    echo "  pkm install <pkg_name>       Install a package from recipe"
+    echo "  pkm switch <pkg_name> <ver>  Switch package version"
+    echo "  pkm list                     List all installed packages"
+    echo "  pkm help                     Show this help menu"
 }
 
-# Command routing
-case "$1" in
-    install)  install_package "$2" ;;
-    switch)   switch_version "$2" "$3" ;;
-    remove)   remove_package "$2" ;;
-    list)     list_packages ;;
-    update)   update_pkm ;;
+COMMAND=${1:-"help"}
+
+case "$COMMAND" in
+    install)
+        install_package "$2"
+        ;;
+    switch)
+        switch_version "$2" "$3"
+        ;;
+    list)
+        list_packages
+        ;;
+    help)
+        show_help
+        ;;
     *)
-        echo "PKM Usage:"
-        echo "  pkm install <pkg>         - Install a package"
-        echo "  pkm switch <pkg> <ver>    - Switch to installed version"
-        echo "  pkm remove <pkg>          - Remove a package"
-        echo "  pkm list                  - List installed packages and versions"
-        echo "  pkm update                - Update recipes from GitHub"
+        log_error "Invalid command: '$COMMAND'."
+        show_help
+        exit 1
         ;;
 esac
